@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>EXTROS</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="stage"><canvas id="cv"></canvas></div>
+<script>
+  // Eruda console — only when explicitly requested, so it never ships to players.
+  if (location.search.indexOf('debug=1') > -1) {
+    var erudaScript = document.createElement('script');
+    erudaScript.src = 'https://cdn.jsdelivr.net/npm/eruda';
+    erudaScript.onload = function () { eruda.init(); };
+    document.head.appendChild(erudaScript);
+  }
+</script>
+<script src="core.js"></script>
+<script src="state.js"></script>
+<script src="physics.js"></script>
+<script src="input.js"></script>
+<script src="draw.js"></script>
+<script src="debug.js"></script>
+<script>
+  EXTROS.core.start();
+</script>
+</body>
+</html>
