@@ -26,14 +26,23 @@ KAIJU_WIDTH_RATIO = 0.62       # sprite width as a fraction of its height
 ARENA_MIN_DIST = 80.0
 ARENA_MAX_DIST = 400.0
 
-LOOK_ZONE_FRAC = 0.40          # left 40% of screen is the look/drag zone
-LOOK_SENSITIVITY = 0.25        # deg of yaw per pixel of horizontal drag
+# Pygame on Android is CPU blit, fill-rate bound -- render at a fraction of
+# native resolution and scale up once. Drop to 0.4 if still short of 30fps.
+RENDER_SCALE = 0.5
+TARGET_FPS = 30
 
-FIRE_BTN_RADIUS = 70
-DODGE_BTN_RADIUS = 55
+LOOK_SENSITIVITY = 0.22        # deg of yaw per pixel of horizontal drag, at real screen scale
+LOOK_SMOOTHING = 0.35          # 0 = raw, 1 = frozen
+LOOK_MOMENTUM_TIME = 0.3       # seconds a flick keeps coasting after finger-up
+EDGE_ZONE_FRAC = 0.12          # width of the double-tap-to-dodge edge strips
+DOUBLE_TAP_WINDOW = 0.3        # seconds between taps to count as a double-tap
+
+FIRE_BTN_RADIUS = 75
+DODGE_BTN_RADIUS = 65
 BTN_GAP = 24
 BTN_MARGIN = 40
 BTN_Y_FRAC = 0.80
+BTN_HIT_PAD = 1.2              # hit-test radius vs drawn radius -- forgiveness
 
 FIRE_RATE = 6.0                 # shots/sec while held
 FIRE_INTERVAL = 1.0 / FIRE_RATE
@@ -78,6 +87,9 @@ KILL_HITSTOP = 0.12
 PLATE_BREAK_HITSTOP = 0.04
 LOSE_DELAY = 0.6
 
+DEBUG_TOUCH = True     # draws finger positions + look/fire state
+DEBUG_PERF = True      # draws fps + frame ms
+
 # palette -- cold greens/cyans on near-black, red reserved for danger
 COL_BG_SKY = (8, 16, 20)
 COL_BG_GROUND = (5, 10, 12)
@@ -117,6 +129,7 @@ class Player:
     def __init__(self):
         self.angle = 0.0          # position on the arena rim (deg)
         self.yaw = 0.0             # look direction (deg)
+        self.yaw_velocity = 0.0    # deg/frame, carries momentum after finger-up
         self.hp = PLAYER_MAX_HP
 
         self.heat = 0.0
@@ -281,7 +294,8 @@ class Kaiju:
 
 
 # ===========================================================================
-# CITY -- purely cosmetic parallax silhouette
+# CITY -- purely cosmetic parallax silhouette, pre-baked to two texture
+# strips at startup so the fight loop only ever does two blits for it.
 # ===========================================================================
 
 class Building:
@@ -303,13 +317,33 @@ def generate_city(count=40, seed=1337):
         width = rng.uniform(18, 46) if layer == 0 else rng.uniform(26, 60)
         angle = rng.uniform(0, 360)
         buildings.append(Building(angle, height, width, layer))
-    buildings.sort(key=lambda b: b.layer)
     return buildings
 
 
 LAYER_PARALLAX = (0.45, 0.8)
 LAYER_PX_PER_M = (0.9, 1.5)
 LAYER_COLOR = (COL_BUILDING_FAR, COL_BUILDING_NEAR)
+
+
+def build_city_layer(buildings, layer, width, height, horizon_y, scale):
+    """Pre-render one parallax layer to a wide strip covering a full 360
+    degree pan, with the first `width` px duplicated onto the far end so a
+    visible window never needs to wrap mid-frame."""
+    ppd = (width / FOV) * LAYER_PARALLAX[layer]
+    base_w = max(width + 1, int(360 * ppd))
+    strip_w = base_w + width
+    strip = pygame.Surface((strip_w, height), pygame.SRCALPHA)
+    px_per_m = LAYER_PX_PER_M[layer] * scale
+    for b in buildings:
+        if b.layer != layer:
+            continue
+        cx = b.angle * ppd
+        h_px = b.height * px_per_m
+        w_px = b.width * px_per_m
+        y = horizon_y - h_px
+        for x0 in (cx, cx + base_w):
+            pygame.draw.rect(strip, LAYER_COLOR[layer], (x0 - w_px / 2.0, y, w_px, h_px))
+    return strip.convert_alpha(), ppd, base_w
 
 
 # ===========================================================================
@@ -322,29 +356,47 @@ class Game:
         pygame.display.set_caption("KAIJU PROTOCOL")
 
         info = pygame.display.Info()
-        w, h = info.current_w, info.current_h
-        if w <= 0 or h <= 0:
-            w, h = DESIGN_W, DESIGN_H
+        real_w, real_h = info.current_w, info.current_h
+        if real_w <= 0 or real_h <= 0:
+            real_w, real_h = DESIGN_W, DESIGN_H
         try:
-            self.screen = pygame.display.set_mode((w, h), pygame.FULLSCREEN)
+            self.screen = pygame.display.set_mode((real_w, real_h), pygame.FULLSCREEN | pygame.DOUBLEBUF)
         except pygame.error:
             self.screen = pygame.display.set_mode((DESIGN_W, DESIGN_H))
-        self.width, self.height = self.screen.get_size()
+        self.real_w, self.real_h = self.screen.get_size()
+
+        # Everything below draws into a smaller logical surface that gets
+        # scaled up once at the end of every frame -- see draw(). All game
+        # logic, layout, and touch math operates in this logical space.
+        self.width = max(1, int(self.real_w * RENDER_SCALE))
+        self.height = max(1, int(self.real_h * RENDER_SCALE))
         self.center_x = self.width / 2.0
         self.scale = min(self.width / DESIGN_W, self.height / DESIGN_H)
+        # touch deltas are tracked in logical (downscaled) pixels, but look
+        # sensitivity is tuned per real screen pixel -- compensate so turn
+        # speed doesn't change with RENDER_SCALE.
+        self.look_sens = LOOK_SENSITIVITY * (self.real_w / self.width)
         self.horizon_y = self.height * HORIZON_FRAC
 
-        self.canvas = pygame.Surface((self.width, self.height))
+        self.canvas = pygame.Surface((self.width, self.height)).convert()
+        self.frame_buffer = pygame.Surface((self.width, self.height)).convert()
         self.clock = pygame.time.Clock()
         self.running = True
 
         self._build_fonts()
         self._build_scanlines()
+        self._build_vignette()
+        self._build_white_flash()
         self._build_layout()
-        self.buildings = generate_city()
+        self._build_city()
+
+        self.text_cache = {}
+        self.button_cache = {}
 
         self.touches = {}
         self.touch_mode = False
+        self.pending_look_dx = 0.0
+        self.last_edge_tap = {"left": -999.0, "right": -999.0}
 
         self.time_scale = 1.0
         self.hitstop_timer = 0.0
@@ -378,12 +430,31 @@ class Game:
         self.font_med = pygame.font.SysFont(None, max(18, int(28 * s)))
         self.font_big = pygame.font.SysFont(None, max(28, int(44 * s)))
         self.font_huge = pygame.font.SysFont(None, max(40, int(72 * s)))
+        self.font_debug = pygame.font.SysFont(None, 22)  # fixed size, drawn at real res
 
     def _build_scanlines(self):
         surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
         for y in range(0, self.height, 3):
-            pygame.draw.line(surf, (0, 0, 0, 28), (0, y), (self.width, y))
-        self.scanline_surf = surf
+            pygame.draw.line(surf, (0, 0, 0, 40), (0, y), (self.width, y))
+        self.scanline_surf = surf.convert_alpha()
+
+    def _build_vignette(self):
+        w, h = self.width, self.height
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        edge = max(1, int(min(w, h) * 0.18))
+        for i in range(edge):
+            alpha = int(255 * (1.0 - i / edge))
+            col = (*COL_RED, alpha)
+            pygame.draw.rect(surf, col, (0, i, w, 1))
+            pygame.draw.rect(surf, col, (0, h - i - 1, w, 1))
+            pygame.draw.rect(surf, col, (i, 0, 1, h))
+            pygame.draw.rect(surf, col, (w - i - 1, 0, 1, h))
+        self.vignette_surf = surf.convert_alpha()
+
+    def _build_white_flash(self):
+        surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        surf.fill((255, 255, 255, 255))
+        self.white_flash_surf = surf.convert_alpha()
 
     def _build_layout(self):
         s = self.scale
@@ -394,10 +465,19 @@ class Game:
         by = self.height * BTN_Y_FRAC
         self.fire_btn_pos = (self.width - margin - fire_r, by)
         self.fire_btn_r = fire_r
+        self.fire_btn_hit_r = fire_r * BTN_HIT_PAD
         dr_x = self.fire_btn_pos[0] - fire_r - gap - dodge_r
         self.dodge_r_pos = (dr_x, by)
         self.dodge_l_pos = (dr_x - dodge_r * 2 - gap, by)
         self.dodge_btn_r = dodge_r
+        self.dodge_btn_hit_r = dodge_r * BTN_HIT_PAD
+
+    def _build_city(self):
+        buildings = generate_city()
+        self.city_layers = [
+            build_city_layer(buildings, layer, self.width, self.height, self.horizon_y, self.scale)
+            for layer in (0, 1)
+        ]
 
     def reset_game(self):
         self.player = Player()
@@ -412,6 +492,31 @@ class Game:
         self.hitstop_timer = 0.0
         self.white_flash_timer = 0.0
         self.result_kind = None
+
+    # -- cached drawing helpers ---------------------------------------------
+
+    def text(self, s, font, color):
+        key = (s, id(font), color)
+        surf = self.text_cache.get(key)
+        if surf is None:
+            surf = font.render(s, True, color).convert_alpha()
+            if len(self.text_cache) > 200:
+                self.text_cache.clear()
+            self.text_cache[key] = surf
+        return surf
+
+    def button_surface(self, radius, color, active):
+        key = (int(radius), color, active)
+        surf = self.button_cache.get(key)
+        if surf is None:
+            r = int(radius)
+            surf = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+            alpha = 140 if active else 70
+            pygame.draw.circle(surf, (*color, alpha), (r, r), r)
+            pygame.draw.circle(surf, (*color, 220), (r, r), r, max(2, int(2 * self.scale)))
+            surf = surf.convert_alpha()
+            self.button_cache[key] = surf
+        return surf
 
     # -- feedback helpers ---------------------------------------------------
 
@@ -485,15 +590,29 @@ class Game:
     # -- input --------------------------------------------------------------
 
     def zone_at(self, x, y):
-        if x < self.width * LOOK_ZONE_FRAC:
-            return "look"
-        if _dist(x, y, *self.fire_btn_pos) <= self.fire_btn_r:
+        """Buttons are the only exceptions -- everything else turns the
+        camera, matching how every mobile FPS handles look-drag."""
+        if _dist(x, y, *self.fire_btn_pos) <= self.fire_btn_hit_r:
             return "fire"
-        if _dist(x, y, *self.dodge_r_pos) <= self.dodge_btn_r:
+        if _dist(x, y, *self.dodge_r_pos) <= self.dodge_btn_hit_r:
             return "dodge_r"
-        if _dist(x, y, *self.dodge_l_pos) <= self.dodge_btn_r:
+        if _dist(x, y, *self.dodge_l_pos) <= self.dodge_btn_hit_r:
             return "dodge_l"
-        return None
+        return "look"
+
+    def _check_edge_double_tap(self, x, now):
+        if x < self.width * EDGE_ZONE_FRAC:
+            if now - self.last_edge_tap["left"] < DOUBLE_TAP_WINDOW:
+                self.player.try_dodge(-1, self)
+                self.last_edge_tap["left"] = -999.0
+            else:
+                self.last_edge_tap["left"] = now
+        elif x > self.width * (1.0 - EDGE_ZONE_FRAC):
+            if now - self.last_edge_tap["right"] < DOUBLE_TAP_WINDOW:
+                self.player.try_dodge(1, self)
+                self.last_edge_tap["right"] = -999.0
+            else:
+                self.last_edge_tap["right"] = now
 
     def touch_down(self, tid, x, y):
         if self.state == "RESULT":
@@ -505,14 +624,17 @@ class Game:
             self.player.try_dodge(-1, self)
         elif zone == "dodge_r":
             self.player.try_dodge(1, self)
+        elif zone == "look":
+            self._check_edge_double_tap(x, pygame.time.get_ticks() / 1000.0)
 
     def touch_move(self, tid, x, y):
         t = self.touches.get(tid)
         if t is None:
             return
         if t["zone"] == "look":
-            dx = x - t["last_x"]
-            self.player.yaw = (self.player.yaw + dx * LOOK_SENSITIVITY) % 360.0
+            # Track absolute position and diff ourselves -- some SDL builds
+            # report event.dx/dy as 0..1 normalized deltas, not pixels.
+            self.pending_look_dx += x - t["last_x"]
         t["last_x"], t["last_y"] = x, y
 
     def touch_up(self, tid):
@@ -521,6 +643,13 @@ class Game:
     @property
     def fire_held(self):
         return any(t["zone"] == "fire" for t in self.touches.values())
+
+    @property
+    def look_active(self):
+        return any(t["zone"] == "look" for t in self.touches.values())
+
+    def _to_logical(self, rx, ry):
+        return rx * self.width / self.real_w, ry * self.height / self.real_h
 
     def handle_event(self, ev):
         if ev.type == pygame.QUIT:
@@ -535,10 +664,12 @@ class Game:
         elif hasattr(pygame, "FINGERUP") and ev.type == pygame.FINGERUP:
             self.touch_up(ev.finger_id)
         elif ev.type == pygame.MOUSEBUTTONDOWN and not self.touch_mode:
-            self.touch_down("mouse", *ev.pos)
+            lx, ly = self._to_logical(*ev.pos)
+            self.touch_down("mouse", lx, ly)
         elif ev.type == pygame.MOUSEMOTION and not self.touch_mode:
             if "mouse" in self.touches:
-                self.touch_move("mouse", *ev.pos)
+                lx, ly = self._to_logical(*ev.pos)
+                self.touch_move("mouse", lx, ly)
         elif ev.type == pygame.MOUSEBUTTONUP and not self.touch_mode:
             self.touch_up("mouse")
 
@@ -612,8 +743,22 @@ class Game:
             "height_px": height_px,
         }
 
+    def _update_look(self, real_dt):
+        raw_delta = self.pending_look_dx * self.look_sens
+        self.pending_look_dx = 0.0
+        p = self.player
+        if self.look_active:
+            p.yaw_velocity = p.yaw_velocity * LOOK_SMOOTHING + raw_delta * (1.0 - LOOK_SMOOTHING)
+        elif p.yaw_velocity:
+            p.yaw_velocity *= 0.0001 ** (real_dt / LOOK_MOMENTUM_TIME)
+            if abs(p.yaw_velocity) < 0.001:
+                p.yaw_velocity = 0.0
+        p.yaw = (p.yaw + p.yaw_velocity) % 360.0
+
     def update(self, real_dt):
         real_dt = min(real_dt, 0.05)
+
+        self._update_look(real_dt)
 
         if self.shake_timer > 0.0:
             self.shake_timer = max(0.0, self.shake_timer - real_dt)
@@ -676,7 +821,7 @@ class Game:
 
     def draw(self):
         c = self.canvas
-        c.fill(COL_BG_SKY)
+        pygame.draw.rect(c, COL_BG_SKY, (0, 0, self.width, self.horizon_y))
         pygame.draw.rect(c, COL_BG_GROUND, (0, self.horizon_y, self.width, self.height - self.horizon_y))
         pygame.draw.line(c, COL_HORIZON_GLOW, (0, self.horizon_y), (self.width, self.horizon_y), max(1, int(2 * self.scale)))
 
@@ -688,26 +833,36 @@ class Game:
 
         draw_hud(c, self)
 
-        # compose with screenshake + dash tilt
+        # compose shake + dash tilt + scanlines onto the reused frame buffer,
+        # then a single upscale blit to the real screen -- no per-frame allocs
+        fb = self.frame_buffer
+        fb.fill((0, 0, 0))
         final = c
         if self.player.tilt:
             final = pygame.transform.rotate(c, self.player.tilt)
-        rect = final.get_rect(center=(self.width / 2.0 + self.shake_x, self.height / 2.0 + self.shake_y))
-        self.screen.fill((0, 0, 0))
-        self.screen.blit(final, rect)
+            rect = final.get_rect(center=(self.width / 2.0 + self.shake_x, self.height / 2.0 + self.shake_y))
+            fb.blit(final, rect)
+        else:
+            fb.blit(c, (self.shake_x, self.shake_y))
+
+        fb.blit(self.scanline_surf, (0, 0))
 
         if self.white_flash_timer > 0.0:
-            a = int(255 * (self.white_flash_timer / 0.3))
-            flash = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-            flash.fill((255, 255, 255, a))
-            self.screen.blit(flash, (0, 0))
+            self.white_flash_surf.set_alpha(int(255 * (self.white_flash_timer / 0.3)))
+            fb.blit(self.white_flash_surf, (0, 0))
 
-        self.screen.blit(self.scanline_surf, (0, 0))
+        pygame.transform.scale(fb, (self.real_w, self.real_h), self.screen)
+
+        if DEBUG_TOUCH:
+            draw_touch_debug(self)
+        if DEBUG_PERF:
+            draw_perf_debug(self)
+
         pygame.display.flip()
 
     def run(self):
         while self.running:
-            real_dt = self.clock.tick(60) / 1000.0
+            real_dt = self.clock.tick(TARGET_FPS) / 1000.0
             for ev in pygame.event.get():
                 self.handle_event(ev)
             self.update(real_dt)
@@ -824,21 +979,14 @@ def draw_kaiju(surf, game):
         surf.blit(burst, (bx - radius, by - radius))
 
 # ===========================================================================
-# DRAWING -- city
+# DRAWING -- city (pre-baked strips, two blits total)
 # ===========================================================================
 
 def draw_city(surf, game):
-    for building in game.buildings:
-        rel_raw = angle_diff(building.angle, game.player.yaw)
-        if abs(rel_raw) > FOV / 2.0 + 40.0:
-            continue
-        rel = rel_raw * LAYER_PARALLAX[building.layer]
-        screen_x = game.center_x + (rel / (FOV / 2.0)) * (game.width / 2.0)
-        px_per_m = LAYER_PX_PER_M[building.layer] * game.scale
-        h_px = building.height * px_per_m
-        w_px = building.width * px_per_m
-        rect = pygame.Rect(screen_x - w_px / 2.0, game.horizon_y - h_px, w_px, h_px)
-        pygame.draw.rect(surf, LAYER_COLOR[building.layer], rect)
+    for strip, ppd, base_w in game.city_layers:
+        offset = (game.player.yaw * ppd - game.width / 2.0) % base_w
+        src_rect = pygame.Rect(int(offset), 0, game.width, game.height)
+        surf.blit(strip, (0, 0), src_rect)
 
 
 # ===========================================================================
@@ -846,11 +994,6 @@ def draw_city(surf, game):
 # ===========================================================================
 
 def draw_hud(surf, game):
-    s = game.scale
-    w, h = game.width, game.height
-    p = game.player
-    k = game.kaiju
-
     if game.state == "COUNTDOWN":
         draw_countdown(surf, game)
     elif game.state == "FIGHT":
@@ -871,12 +1014,11 @@ def draw_hud(surf, game):
 def draw_top_bar(surf, game):
     s = game.scale
     pad = 20 * s
-    label = f"TARGET: {KAIJU_NAME}"
-    txt = game.font_small.render(label, True, COL_CYAN)
+    txt = game.text(f"TARGET: {KAIJU_NAME}", game.font_small, COL_CYAN)
     surf.blit(txt, (pad, pad))
 
-    dist_m = int(game.kaiju.dist)
-    dtxt = game.font_small.render(f"DIST {dist_m}m", True, COL_CYAN)
+    dist_m = int(game.kaiju.dist // 5 * 5)
+    dtxt = game.text(f"DIST {dist_m}m", game.font_small, COL_CYAN)
     surf.blit(dtxt, (game.width - dtxt.get_width() - pad, pad))
 
 
@@ -958,11 +1100,11 @@ def draw_heat_bar(surf, game):
 
     label = "OVERHEAT" if p.overheated else "HEAT"
     col = COL_RED if p.overheated else COL_CYAN
-    ltxt = game.font_tiny.render(label, True, col)
+    ltxt = game.text(label, game.font_tiny, col)
     surf.blit(ltxt, (x, y - ltxt.get_height() - 4 * s))
 
     if p.overheated and int(pygame.time.get_ticks() * 0.006) % 2 == 0:
-        warn = game.font_med.render("OVERHEAT", True, COL_RED)
+        warn = game.text("OVERHEAT", game.font_med, COL_RED)
         surf.blit(warn, (game.center_x - warn.get_width() / 2, game.height * 0.3))
 
 
@@ -976,7 +1118,7 @@ def draw_health(surf, game):
     y = game.height - 70 * s
     filled = round(p.hp / PLAYER_MAX_HP * segments)
 
-    label = game.font_tiny.render("HULL", True, COL_CYAN)
+    label = game.text("HULL", game.font_tiny, COL_CYAN)
     surf.blit(label, (x0, y - label.get_height() - 4 * s))
 
     frac = p.hp / PLAYER_MAX_HP
@@ -997,7 +1139,7 @@ def draw_warning(surf, game):
     flash = (math.sin(pygame.time.get_ticks() * 0.02) + 1.0) * 0.5
     if flash < 0.5:
         return
-    txt = game.font_huge.render("WARNING", True, COL_RED)
+    txt = game.text("WARNING", game.font_huge, COL_RED)
     surf.blit(txt, (game.center_x - txt.get_width() / 2, game.height * 0.22))
 
 
@@ -1005,22 +1147,19 @@ def draw_dodge_flash(surf, game):
     if game.dodge_flash_timer <= 0.0:
         return
     a = int(255 * (game.dodge_flash_timer / 0.5))
-    txt = game.font_med.render("DODGED", True, COL_GREEN)
+    txt = game.text("DODGED", game.font_med, COL_GREEN)
     txt.set_alpha(a)
     surf.blit(txt, (game.center_x - txt.get_width() / 2, game.height * 0.38))
+    txt.set_alpha(255)
 
 
 def draw_buttons(surf, game):
-    s = game.scale
     p = game.player
 
-    def circle(pos, radius, label, active, color):
-        overlay = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-        alpha = 140 if active else 70
-        pygame.draw.circle(overlay, (*color, alpha), (radius, radius), radius)
-        pygame.draw.circle(overlay, (*color, 220), (radius, radius), radius, max(2, int(2 * s)))
-        surf.blit(overlay, (pos[0] - radius, pos[1] - radius))
-        txt = game.font_small.render(label, True, COL_WHITE)
+    def circle(pos, radius, label, active, color, label_color=COL_WHITE):
+        base = game.button_surface(radius, color, active)
+        surf.blit(base, (pos[0] - radius, pos[1] - radius))
+        txt = game.text(label, game.font_small, label_color)
         surf.blit(txt, (pos[0] - txt.get_width() / 2, pos[1] - txt.get_height() / 2))
 
     fire_active = game.fire_held
@@ -1036,22 +1175,11 @@ def draw_buttons(surf, game):
 def draw_vignette(surf, game):
     if game.vignette_timer <= 0.0:
         return
-    a = int(160 * (game.vignette_timer / 0.4))
-    w, h = game.width, game.height
-    edge = int(min(w, h) * 0.18)
-    overlay = pygame.Surface((w, h), pygame.SRCALPHA)
-    for i in range(edge):
-        alpha = int(a * (1.0 - i / edge))
-        col = (*COL_RED, alpha)
-        pygame.draw.rect(overlay, col, (0, i, w, 1))
-        pygame.draw.rect(overlay, col, (0, h - i - 1, w, 1))
-        pygame.draw.rect(overlay, col, (i, 0, 1, h))
-        pygame.draw.rect(overlay, col, (w - i - 1, 0, 1, h))
-    surf.blit(overlay, (0, 0))
+    game.vignette_surf.set_alpha(int(160 * (game.vignette_timer / 0.4)))
+    surf.blit(game.vignette_surf, (0, 0))
 
 
 def draw_countdown(surf, game):
-    s = game.scale
     draw_city(surf, game)
     if game.kaiju_proj is None:
         game.compute_kaiju_projection()
@@ -1061,10 +1189,10 @@ def draw_countdown(surf, game):
     t = game.countdown_timer
     n = int(math.ceil(t))
     n = max(1, min(3, n))
-    txt = game.font_huge.render(str(n), True, COL_CYAN)
+    txt = game.text(str(n), game.font_huge, COL_CYAN)
     surf.blit(txt, (game.center_x - txt.get_width() / 2, game.height * 0.4))
 
-    boot = game.font_small.render("SYSTEMS ONLINE", True, COL_GREEN)
+    boot = game.text("SYSTEMS ONLINE", game.font_small, COL_GREEN)
     surf.blit(boot, (game.center_x - boot.get_width() / 2, game.height * 0.4 + txt.get_height()))
 
 
@@ -1089,7 +1217,7 @@ def draw_result(surf, game):
         title = "MECH DOWN"
         col = COL_RED
 
-    t_txt = game.font_big.render(title, True, col)
+    t_txt = game.text(title, game.font_big, col)
     surf.blit(t_txt, (cx - t_txt.get_width() / 2, y))
     y += t_txt.get_height() + 30 * s
 
@@ -1102,8 +1230,8 @@ def draw_result(surf, game):
         ("RANK", game.result_rank),
     ]
     for label, value in rows:
-        ltxt = game.font_med.render(label, True, COL_CYAN_DIM)
-        vtxt = game.font_med.render(value, True, COL_WHITE)
+        ltxt = game.text(label, game.font_med, COL_CYAN_DIM)
+        vtxt = game.text(value, game.font_med, COL_WHITE)
         surf.blit(ltxt, (cx - 160 * s, y))
         surf.blit(vtxt, (cx + 40 * s, y))
         y += ltxt.get_height() + 10 * s
@@ -1111,8 +1239,36 @@ def draw_result(surf, game):
     y += 30 * s
     flash = (math.sin(pygame.time.get_ticks() * 0.004) + 1.0) * 0.5
     prompt_col = tuple(int(lerp(COL_CYAN_DIM[i], COL_CYAN[i], flash)) for i in range(3))
-    prompt = game.font_med.render("[ TAP TO RETRY ]", True, prompt_col)
+    prompt = game.text("[ TAP TO RETRY ]", game.font_med, prompt_col)
     surf.blit(prompt, (cx - prompt.get_width() / 2, y))
+
+
+# ===========================================================================
+# DEBUG OVERLAYS -- drawn directly on the real screen, after upscale, so
+# they stay crisp regardless of RENDER_SCALE.
+# ===========================================================================
+
+def draw_touch_debug(game):
+    screen = game.screen
+    font = game.font_debug
+    sx, sy = game.real_w / game.width, game.real_h / game.height
+    for tid, t in game.touches.items():
+        rx, ry = t["last_x"] * sx, t["last_y"] * sy
+        col = {"look": COL_CYAN, "fire": COL_ORANGE, "dodge_l": COL_GREEN, "dodge_r": COL_GREEN}.get(t["zone"], COL_WHITE)
+        pygame.draw.circle(screen, col, (int(rx), int(ry)), 18, 3)
+        label = font.render(f"{tid}:{t['zone']}", True, col)
+        screen.blit(label, (rx + 22, ry - 10))
+
+    info = f"look_active={game.look_active} fire_held={game.fire_held} yaw={game.player.yaw:.1f} yaw_vel={game.player.yaw_velocity:.2f}"
+    txt = font.render(info, True, COL_CYAN)
+    screen.blit(txt, (10, game.real_h - 30))
+
+
+def draw_perf_debug(game):
+    fps = game.clock.get_fps()
+    ms = game.clock.get_time()
+    txt = game.font_debug.render(f"FPS {fps:.0f}  {ms}ms  render={game.width}x{game.height}", True, COL_GREEN)
+    game.screen.blit(txt, (10, 10))
 
 
 # ===========================================================================
