@@ -19,15 +19,17 @@ import pygame
 DESIGN_W, DESIGN_H = 1280, 720
 
 FOV = 75.0                     # degrees
-HORIZON_FRAC = 0.62            # horizon sits 62% down the screen
-BASE_HEIGHT = 400.0            # kaiju sprite height at dist=100m, pre-scale
+HORIZON_FRAC = 0.72            # horizon sits low so a close kaiju stays hittable
+BASE_HEIGHT = 700.0            # kaiju sprite height at dist=100m, pre-scale
 KAIJU_WIDTH_RATIO = 0.62       # sprite width as a fraction of its height
 
-ARENA_MIN_DIST = 80.0
-ARENA_MAX_DIST = 400.0
+ARENA_MIN_DIST = 45.0
+ARENA_MAX_DIST = 180.0
 
 # Pygame on Android is CPU blit, fill-rate bound -- render at a fraction of
-# native resolution and scale up once. Drop to 0.4 if still short of 30fps.
+# native resolution. pygame.SCALED hands the upscale to SDL's renderer
+# instead of a manual per-frame transform.scale. Drop to 0.4 if still short
+# of 30fps.
 RENDER_SCALE = 0.5
 TARGET_FPS = 30
 
@@ -64,6 +66,7 @@ DODGE_ANGLE = 12.0                # degrees, total shift over the dash
 DODGE_DURATION = 0.35
 DODGE_COOLDOWN = 0.8
 DODGE_INVULN = 0.25               # seconds of i-frames at the start of the dash
+DASH_PUSH_PX = 30.0                # lateral camera kick during a dash, design px
 
 # The single most important number in the prototype -- how readable is the
 # telegraph? Tune this first if the fight feels unfair or too easy.
@@ -75,10 +78,11 @@ APPROACH_TIME_MAX = 4.0
 APPROACH_CLOSE_RATE = 25.0        # m/s
 APPROACH_DRIFT_RATE = 6.0         # deg/s sideways drift
 CHARGE_CLOSE_FACTOR = 0.4         # CHARGE multiplies dist by this
-ROAR_MIN_DIST = 200.0             # ROAR only selectable at range
+ROAR_MIN_DIST = 110.0             # ROAR only selectable at range
 
 KAIJU_MAX_HP = 1000.0
 KAIJU_NAME = "VARANT-CLASS"
+KAIJU_START_DIST = 160.0
 
 COUNTDOWN_TIME = 3.0
 KILL_SLOWMO_TIME = 1.5
@@ -87,8 +91,9 @@ KILL_HITSTOP = 0.12
 PLATE_BREAK_HITSTOP = 0.04
 LOSE_DELAY = 0.6
 
-DEBUG_TOUCH = True     # draws finger positions + look/fire state
-DEBUG_PERF = True      # draws fps + frame ms
+DEBUG_TOUCH = True         # draws finger positions + look/fire state
+DEBUG_PERF = True          # draws fps + build info
+DEBUG_TEXT_REFRESH = 0.25  # seconds between debug text re-renders
 
 # palette -- cold greens/cyans on near-black, red reserved for danger
 COL_BG_SKY = (8, 16, 20)
@@ -106,11 +111,21 @@ COL_KAIJU_OUTLINE = (90, 200, 190)
 COL_PLATE = (70, 90, 92)
 COL_BUILDING_FAR = (14, 26, 28)
 COL_BUILDING_NEAR = (10, 20, 22)
+NEAR_LAYER_COLORKEY = (255, 0, 255)
 
 
 def angle_diff(a, b):
     """Shortest signed difference a-b, normalized to -180..180."""
     return (a - b + 180.0) % 360.0 - 180.0
+
+
+def wrap360(a):
+    """Float-safe wrap to [0, 360) -- plain % can land exactly on 360.0
+    after enough accumulated additions."""
+    a %= 360.0
+    if a >= 360.0:
+        a -= 360.0
+    return a
 
 
 def clamp(v, lo, hi):
@@ -143,7 +158,8 @@ class Player:
         self.dodge_timer = 0.0
         self.dodge_dir = 0
         self.invulnerable = False
-        self.tilt = 0.0
+        self.dash_push = 0.0        # lateral camera kick, logical px, this frame
+        self.dash_push_max = 0.0
 
         self.shots_fired = 0
         self.shots_hit = 0
@@ -156,6 +172,7 @@ class Player:
             self.dodge_dir = direction
             self.invulnerable = True
             self.dodge_cooldown = DODGE_COOLDOWN
+            self.dash_push_max = DASH_PUSH_PX * game.scale
             game.add_shake(5, 0.15)
 
     def update(self, dt):
@@ -168,12 +185,12 @@ class Player:
             self.dodge_timer += dt
             self.angle += self.dodge_dir * DODGE_ANGLE * (dt / DODGE_DURATION)
             t = clamp(self.dodge_timer / DODGE_DURATION, 0.0, 1.0)
-            self.tilt = math.sin(t * math.pi) * 8.0 * self.dodge_dir
+            self.dash_push = math.sin(t * math.pi) * self.dash_push_max * self.dodge_dir
             if self.dodge_timer >= DODGE_INVULN:
                 self.invulnerable = False
             if self.dodge_timer >= DODGE_DURATION:
                 self.dodging = False
-                self.tilt = 0.0
+                self.dash_push = 0.0
 
         if self.fire_cooldown > 0.0:
             self.fire_cooldown = max(0.0, self.fire_cooldown - dt)
@@ -215,7 +232,7 @@ PLATE_LOCAL_RECTS = {
 class Kaiju:
     def __init__(self):
         self.angle = 0.0
-        self.dist = 300.0
+        self.dist = KAIJU_START_DIST
         self.hp = KAIJU_MAX_HP
         self.max_hp = KAIJU_MAX_HP
         self.plates = {name: {"hp": 100.0, "intact": True} for name in PLATE_NAMES}
@@ -266,18 +283,17 @@ class Kaiju:
         self._resolve_attack(game)
 
     def _resolve_attack(self, game):
+        # All three attacks share one answer: dodge i-frames timed off the
+        # telegraph. ROAR used to be unconditional guaranteed damage -- that
+        # read as the game cheating, so it now follows the same rule.
         player = game.player
-        if self.attack_type in ("SWIPE", "CHARGE"):
-            avoided = player.invulnerable
-            if self.attack_type == "CHARGE":
-                self.dist = clamp(self.dist * CHARGE_CLOSE_FACTOR, ARENA_MIN_DIST, ARENA_MAX_DIST)
-            if avoided:
-                game.on_dodge_success()
-            else:
-                dmg = CHARGE_DAMAGE if self.attack_type == "CHARGE" else HIT_DAMAGE
-                game.damage_player(dmg)
-        elif self.attack_type == "ROAR":
-            game.damage_player(HIT_DAMAGE)
+        if self.attack_type == "CHARGE":
+            self.dist = clamp(self.dist * CHARGE_CLOSE_FACTOR, ARENA_MIN_DIST, ARENA_MAX_DIST)
+        if player.invulnerable:
+            game.on_dodge_success()
+        else:
+            dmg = CHARGE_DAMAGE if self.attack_type == "CHARGE" else HIT_DAMAGE
+            game.damage_player(dmg)
 
     def _enter_recover(self):
         self.state = "RECOVER"
@@ -294,56 +310,90 @@ class Kaiju:
 
 
 # ===========================================================================
-# CITY -- purely cosmetic parallax silhouette, pre-baked to two texture
-# strips at startup so the fight loop only ever does two blits for it.
+# CITY -- purely cosmetic parallax silhouette. Sky, ground, horizon line and
+# the far building layer share zero horizontal variation in appearance
+# beyond building placement, so they're baked into ONE opaque strip
+# (scanlines too -- horizontal lines are x-invariant, baking them in is
+# visually identical to redrawing them and costs nothing per frame). The
+# near layer is a second, smaller, colorkeyed strip blitted on top.
 # ===========================================================================
 
 class Building:
-    __slots__ = ("angle", "height", "width", "layer")
+    __slots__ = ("angle", "height", "width")
 
-    def __init__(self, angle, height, width, layer):
+    def __init__(self, angle, height, width):
         self.angle = angle
         self.height = height
         self.width = width
-        self.layer = layer
 
 
-def generate_city(count=40, seed=1337):
+def generate_city_layer(layer, count, seed):
     rng = random.Random(seed)
     buildings = []
     for _ in range(count):
-        layer = 0 if rng.random() < 0.5 else 1
-        height = rng.uniform(40, 130) if layer == 0 else rng.uniform(60, 220)
-        width = rng.uniform(18, 46) if layer == 0 else rng.uniform(26, 60)
+        if layer == 0:
+            height = rng.uniform(40, 130)
+            width = rng.uniform(18, 46)
+        else:
+            height = rng.uniform(60, 220)
+            width = rng.uniform(26, 60)
         angle = rng.uniform(0, 360)
-        buildings.append(Building(angle, height, width, layer))
+        buildings.append(Building(angle, height, width))
     return buildings
 
 
 LAYER_PARALLAX = (0.45, 0.8)
 LAYER_PX_PER_M = (0.9, 1.5)
-LAYER_COLOR = (COL_BUILDING_FAR, COL_BUILDING_NEAR)
 
 
-def build_city_layer(buildings, layer, width, height, horizon_y, scale):
-    """Pre-render one parallax layer to a wide strip covering a full 360
-    degree pan, with the first `width` px duplicated onto the far end so a
-    visible window never needs to wrap mid-frame."""
+def _strip_geometry(width, layer):
     ppd = (width / FOV) * LAYER_PARALLAX[layer]
     base_w = max(width + 1, int(360 * ppd))
-    strip_w = base_w + width
-    strip = pygame.Surface((strip_w, height), pygame.SRCALPHA)
-    px_per_m = LAYER_PX_PER_M[layer] * scale
+    return ppd, base_w, base_w + width
+
+
+def build_bg_strip(buildings, width, height, horizon_y, scale):
+    ppd, base_w, strip_w = _strip_geometry(width, 0)
+    strip = pygame.Surface((strip_w, height))
+    strip.fill(COL_BG_SKY)
+    pygame.draw.rect(strip, COL_BG_GROUND, (0, horizon_y, strip_w, height - horizon_y))
+    pygame.draw.line(strip, COL_HORIZON_GLOW, (0, horizon_y), (strip_w, horizon_y), max(1, int(2 * scale)))
+
+    px_per_m = LAYER_PX_PER_M[0] * scale
     for b in buildings:
-        if b.layer != layer:
-            continue
         cx = b.angle * ppd
         h_px = b.height * px_per_m
         w_px = b.width * px_per_m
         y = horizon_y - h_px
         for x0 in (cx, cx + base_w):
-            pygame.draw.rect(strip, LAYER_COLOR[layer], (x0 - w_px / 2.0, y, w_px, h_px))
-    return strip.convert_alpha(), ppd, base_w
+            pygame.draw.rect(strip, COL_BUILDING_FAR, (x0 - w_px / 2.0, y, w_px, h_px))
+
+    # Scanlines are horizontally uniform -- baking them in once at startup
+    # is visually identical to redrawing them every frame, for free.
+    scan = pygame.Surface((strip_w, height), pygame.SRCALPHA)
+    for y in range(0, height, 3):
+        pygame.draw.line(scan, (0, 0, 0, 40), (0, y), (strip_w, y))
+    strip.blit(scan, (0, 0))
+
+    return strip.convert(), ppd, base_w
+
+
+def build_near_layer(buildings, width, height, horizon_y, scale):
+    ppd, base_w, strip_w = _strip_geometry(width, 1)
+    strip = pygame.Surface((strip_w, height))
+    strip.fill(NEAR_LAYER_COLORKEY)
+
+    px_per_m = LAYER_PX_PER_M[1] * scale
+    for b in buildings:
+        cx = b.angle * ppd
+        h_px = b.height * px_per_m
+        w_px = b.width * px_per_m
+        y = horizon_y - h_px
+        for x0 in (cx, cx + base_w):
+            pygame.draw.rect(strip, COL_BUILDING_NEAR, (x0 - w_px / 2.0, y, w_px, h_px))
+
+    strip.set_colorkey(NEAR_LAYER_COLORKEY)
+    return strip.convert(), ppd, base_w
 
 
 # ===========================================================================
@@ -354,23 +404,27 @@ class Game:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("KAIJU PROTOCOL")
+        print(f"pygame {pygame.version.ver}, SDL {pygame.version.SDL}")
 
         info = pygame.display.Info()
         real_w, real_h = info.current_w, info.current_h
         if real_w <= 0 or real_h <= 0:
             real_w, real_h = DESIGN_W, DESIGN_H
-        try:
-            self.screen = pygame.display.set_mode((real_w, real_h), pygame.FULLSCREEN | pygame.DOUBLEBUF)
-        except pygame.error:
-            self.screen = pygame.display.set_mode((DESIGN_W, DESIGN_H))
-        self.real_w, self.real_h = self.screen.get_size()
+        self.real_w, self.real_h = real_w, real_h
 
-        # Everything below draws into a smaller logical surface that gets
-        # scaled up once at the end of every frame -- see draw(). All game
-        # logic, layout, and touch math operates in this logical space.
-        self.width = max(1, int(self.real_w * RENDER_SCALE))
-        self.height = max(1, int(self.real_h * RENDER_SCALE))
+        # Draw at logical (downscaled) resolution and let SDL's renderer do
+        # the upscale via pygame.SCALED -- no manual per-frame transform.
+        self.width = max(1, int(real_w * RENDER_SCALE))
+        self.height = max(1, int(real_h * RENDER_SCALE))
+        try:
+            self.screen = pygame.display.set_mode(
+                (self.width, self.height), pygame.SCALED | pygame.FULLSCREEN
+            )
+        except pygame.error:
+            self.screen = pygame.display.set_mode((self.width, self.height))
+
         self.center_x = self.width / 2.0
+        self.crosshair_y = self.height * 0.5
         self.scale = min(self.width / DESIGN_W, self.height / DESIGN_H)
         # touch deltas are tracked in logical (downscaled) pixels, but look
         # sensitivity is tuned per real screen pixel -- compensate so turn
@@ -378,20 +432,28 @@ class Game:
         self.look_sens = LOOK_SENSITIVITY * (self.real_w / self.width)
         self.horizon_y = self.height * HORIZON_FRAC
 
+        h_far = BASE_HEIGHT * (100.0 / ARENA_MAX_DIST) * self.scale
+        assert self.horizon_y - h_far < self.height * 0.5, (
+            "kaiju is unhittable at max range -- raise BASE_HEIGHT or HORIZON_FRAC"
+        )
+
         self.canvas = pygame.Surface((self.width, self.height)).convert()
-        self.frame_buffer = pygame.Surface((self.width, self.height)).convert()
         self.clock = pygame.time.Clock()
         self.running = True
 
         self._build_fonts()
-        self._build_scanlines()
         self._build_vignette()
         self._build_white_flash()
+        self._build_result_overlay()
         self._build_layout()
         self._build_city()
 
         self.text_cache = {}
         self.button_cache = {}
+        self.debug_touch_surf = None
+        self.debug_perf_surf = None
+        self.debug_refresh_timer = 0.0
+        self.debug_refresh_due = True
 
         self.touches = {}
         self.touch_mode = False
@@ -430,13 +492,7 @@ class Game:
         self.font_med = pygame.font.SysFont(None, max(18, int(28 * s)))
         self.font_big = pygame.font.SysFont(None, max(28, int(44 * s)))
         self.font_huge = pygame.font.SysFont(None, max(40, int(72 * s)))
-        self.font_debug = pygame.font.SysFont(None, 22)  # fixed size, drawn at real res
-
-    def _build_scanlines(self):
-        surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
-        for y in range(0, self.height, 3):
-            pygame.draw.line(surf, (0, 0, 0, 40), (0, y), (self.width, y))
-        self.scanline_surf = surf.convert_alpha()
+        self.font_debug = pygame.font.SysFont(None, 20)
 
     def _build_vignette(self):
         w, h = self.width, self.height
@@ -456,6 +512,11 @@ class Game:
         surf.fill((255, 255, 255, 255))
         self.white_flash_surf = surf.convert_alpha()
 
+    def _build_result_overlay(self):
+        surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        surf.fill((5, 10, 12, 190))
+        self.result_overlay_surf = surf.convert_alpha()
+
     def _build_layout(self):
         s = self.scale
         fire_r = FIRE_BTN_RADIUS * s
@@ -473,11 +534,12 @@ class Game:
         self.dodge_btn_hit_r = dodge_r * BTN_HIT_PAD
 
     def _build_city(self):
-        buildings = generate_city()
-        self.city_layers = [
-            build_city_layer(buildings, layer, self.width, self.height, self.horizon_y, self.scale)
-            for layer in (0, 1)
-        ]
+        far = generate_city_layer(0, 40, seed=1337)
+        near = generate_city_layer(1, 40, seed=4242)
+        self.bg_strip, self.bg_ppd, self.bg_base_w = build_bg_strip(
+            far, self.width, self.height, self.horizon_y, self.scale)
+        self.near_strip, self.near_ppd, self.near_base_w = build_near_layer(
+            near, self.width, self.height, self.horizon_y, self.scale)
 
     def reset_game(self):
         self.player = Player()
@@ -632,8 +694,6 @@ class Game:
         if t is None:
             return
         if t["zone"] == "look":
-            # Track absolute position and diff ourselves -- some SDL builds
-            # report event.dx/dy as 0..1 normalized deltas, not pixels.
             self.pending_look_dx += x - t["last_x"]
         t["last_x"], t["last_y"] = x, y
 
@@ -648,30 +708,34 @@ class Game:
     def look_active(self):
         return any(t["zone"] == "look" for t in self.touches.values())
 
-    def _to_logical(self, rx, ry):
-        return rx * self.width / self.real_w, ry * self.height / self.real_h
-
     def handle_event(self, ev):
         if ev.type == pygame.QUIT:
             self.running = False
         elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
             self.running = False
         elif hasattr(pygame, "FINGERDOWN") and ev.type == pygame.FINGERDOWN:
-            self.touch_mode = True
+            if not self.touch_mode:
+                self.touch_mode = True
+                self.touches.pop("mouse", None)  # drop any phantom pre-detection
             self.touch_down(ev.finger_id, ev.x * self.width, ev.y * self.height)
         elif hasattr(pygame, "FINGERMOTION") and ev.type == pygame.FINGERMOTION:
             self.touch_move(ev.finger_id, ev.x * self.width, ev.y * self.height)
         elif hasattr(pygame, "FINGERUP") and ev.type == pygame.FINGERUP:
             self.touch_up(ev.finger_id)
-        elif ev.type == pygame.MOUSEBUTTONDOWN and not self.touch_mode:
-            lx, ly = self._to_logical(*ev.pos)
-            self.touch_down("mouse", lx, ly)
-        elif ev.type == pygame.MOUSEMOTION and not self.touch_mode:
-            if "mouse" in self.touches:
-                lx, ly = self._to_logical(*ev.pos)
-                self.touch_move("mouse", lx, ly)
-        elif ev.type == pygame.MOUSEBUTTONUP and not self.touch_mode:
-            self.touch_up("mouse")
+        elif ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
+            # Android SDL emits a synthesised mouse event alongside every
+            # FINGER event. getattr(ev, "touch") catches it directly;
+            # self.touch_mode catches it even if that attribute is missing,
+            # once any real finger event has proven this device sends them.
+            if getattr(ev, "touch", False) or self.touch_mode:
+                return
+            if ev.type == pygame.MOUSEBUTTONDOWN:
+                self.touch_down("mouse", *ev.pos)
+            elif ev.type == pygame.MOUSEMOTION:
+                if "mouse" in self.touches:
+                    self.touch_move("mouse", *ev.pos)
+            else:
+                self.touch_up("mouse")
 
     # -- update ---------------------------------------------------------
 
@@ -696,7 +760,7 @@ class Game:
         proj = self.kaiju_proj
         if proj is None:
             return None
-        cx, cy = self.center_x, self.height / 2.0
+        cx, cy = self.center_x, self.crosshair_y
         if not proj["rect"].collidepoint(cx, cy):
             return None
         for name, prect in proj["plate_rects"].items():
@@ -753,10 +817,20 @@ class Game:
             p.yaw_velocity *= 0.0001 ** (real_dt / LOOK_MOMENTUM_TIME)
             if abs(p.yaw_velocity) < 0.001:
                 p.yaw_velocity = 0.0
-        p.yaw = (p.yaw + p.yaw_velocity) % 360.0
+        p.yaw = wrap360(p.yaw + p.yaw_velocity)
 
     def update(self, real_dt):
         real_dt = min(real_dt, 0.05)
+
+        if self.touch_mode:
+            self.touches.pop("mouse", None)
+
+        self.debug_refresh_timer -= real_dt
+        if self.debug_refresh_timer <= 0.0:
+            self.debug_refresh_timer = DEBUG_TEXT_REFRESH
+            self.debug_refresh_due = True
+        else:
+            self.debug_refresh_due = False
 
         self._update_look(real_dt)
 
@@ -798,6 +872,7 @@ class Game:
 
         if self.state == "COUNTDOWN":
             self.countdown_timer -= real_dt
+            self.compute_kaiju_projection()
             if self.countdown_timer <= 0.0:
                 self.state = "FIGHT"
                 self.kaiju.frozen = False
@@ -821,10 +896,6 @@ class Game:
 
     def draw(self):
         c = self.canvas
-        pygame.draw.rect(c, COL_BG_SKY, (0, 0, self.width, self.horizon_y))
-        pygame.draw.rect(c, COL_BG_GROUND, (0, self.horizon_y, self.width, self.height - self.horizon_y))
-        pygame.draw.line(c, COL_HORIZON_GLOW, (0, self.horizon_y), (self.width, self.horizon_y), max(1, int(2 * self.scale)))
-
         draw_city(c, self)
         if self.kaiju_proj is not None and not self.kaiju.dead:
             draw_kaiju(c, self)
@@ -833,25 +904,12 @@ class Game:
 
         draw_hud(c, self)
 
-        # compose shake + dash tilt + scanlines onto the reused frame buffer,
-        # then a single upscale blit to the real screen -- no per-frame allocs
-        fb = self.frame_buffer
-        fb.fill((0, 0, 0))
-        final = c
-        if self.player.tilt:
-            final = pygame.transform.rotate(c, self.player.tilt)
-            rect = final.get_rect(center=(self.width / 2.0 + self.shake_x, self.height / 2.0 + self.shake_y))
-            fb.blit(final, rect)
-        else:
-            fb.blit(c, (self.shake_x, self.shake_y))
-
-        fb.blit(self.scanline_surf, (0, 0))
+        self.screen.fill((0, 0, 0))
+        self.screen.blit(c, (self.shake_x + self.player.dash_push, self.shake_y))
 
         if self.white_flash_timer > 0.0:
             self.white_flash_surf.set_alpha(int(255 * (self.white_flash_timer / 0.3)))
-            fb.blit(self.white_flash_surf, (0, 0))
-
-        pygame.transform.scale(fb, (self.real_w, self.real_h), self.screen)
+            self.screen.blit(self.white_flash_surf, (0, 0))
 
         if DEBUG_TOUCH:
             draw_touch_debug(self)
@@ -971,22 +1029,19 @@ def draw_kaiju(surf, game):
 
     if game.plate_break_flash > 0.0:
         t = 1.0 - game.plate_break_flash / 0.3
-        radius = (10 + t * 55) * game.scale
-        alpha = int(255 * (1.0 - t))
-        burst = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-        pygame.draw.circle(burst, (255, 255, 255, alpha), (radius, radius), radius, max(2, int(3 * game.scale)))
+        radius = int((10 + t * 55) * game.scale)
         bx, by = game.plate_break_pos
-        surf.blit(burst, (bx - radius, by - radius))
+        pygame.draw.circle(surf, COL_WHITE, (int(bx), int(by)), radius, max(2, int(3 * game.scale)))
 
 # ===========================================================================
-# DRAWING -- city (pre-baked strips, two blits total)
+# DRAWING -- city (two pre-baked strips, two blits total)
 # ===========================================================================
 
 def draw_city(surf, game):
-    for strip, ppd, base_w in game.city_layers:
-        offset = (game.player.yaw * ppd - game.width / 2.0) % base_w
-        src_rect = pygame.Rect(int(offset), 0, game.width, game.height)
-        surf.blit(strip, (0, 0), src_rect)
+    bg_off = (game.player.yaw * game.bg_ppd - game.width / 2.0) % game.bg_base_w
+    surf.blit(game.bg_strip, (0, 0), pygame.Rect(int(bg_off), 0, game.width, game.height))
+    near_off = (game.player.yaw * game.near_ppd - game.width / 2.0) % game.near_base_w
+    surf.blit(game.near_strip, (0, 0), pygame.Rect(int(near_off), 0, game.width, game.height))
 
 
 # ===========================================================================
@@ -1004,6 +1059,7 @@ def draw_hud(surf, game):
         draw_health(surf, game)
         draw_warning(surf, game)
         draw_dodge_flash(surf, game)
+        draw_dash_streaks(surf, game)
         draw_buttons(surf, game)
         draw_vignette(surf, game)
         draw_spark(surf, game)
@@ -1040,7 +1096,7 @@ def draw_target_bracket(surf, game):
 
 def draw_crosshair(surf, game):
     s = game.scale
-    cx, cy = game.center_x, game.height / 2.0
+    cx, cy = game.center_x + game.player.dash_push, game.crosshair_y
     p = game.player
     expand = 6 * s if game.fire_held else 0.0
     gap = 10 * s + expand
@@ -1065,7 +1121,7 @@ def draw_spark(surf, game):
     if game.spark_timer <= 0.0:
         return
     s = game.scale
-    cx, cy = game.center_x, game.height / 2.0
+    cx, cy = game.center_x, game.crosshair_y
     t = game.spark_timer / 0.15
     length = 20 * s * t
     for ang in range(0, 360, 45):
@@ -1075,6 +1131,20 @@ def draw_spark(surf, game):
         x2 = cx + math.cos(rad) * (6 * s + length)
         y2 = cy + math.sin(rad) * (6 * s + length)
         pygame.draw.line(surf, COL_WHITE, (x1, y1), (x2, y2), max(1, int(2 * s)))
+
+
+def draw_dash_streaks(surf, game):
+    p = game.player
+    if not p.dodging:
+        return
+    s = game.scale
+    t = clamp(p.dodge_timer / DODGE_DURATION, 0.0, 1.0)
+    length = 70 * s * math.sin(t * math.pi)
+    x_edge = 0 if p.dodge_dir > 0 else game.width
+    dx = length if p.dodge_dir > 0 else -length
+    for frac in (0.3, 0.5, 0.7):
+        y = game.height * frac
+        pygame.draw.line(surf, COL_CYAN_DIM, (x_edge, y), (x_edge + dx, y), max(1, int(3 * s)))
 
 
 def draw_heat_bar(surf, game):
@@ -1180,12 +1250,6 @@ def draw_vignette(surf, game):
 
 
 def draw_countdown(surf, game):
-    draw_city(surf, game)
-    if game.kaiju_proj is None:
-        game.compute_kaiju_projection()
-    if game.kaiju_proj is not None:
-        draw_kaiju(surf, game)
-
     t = game.countdown_timer
     n = int(math.ceil(t))
     n = max(1, min(3, n))
@@ -1197,18 +1261,11 @@ def draw_countdown(surf, game):
 
 
 def draw_result(surf, game):
-    draw_city(surf, game)
-    if game.kaiju_proj is not None:
-        draw_kaiju(surf, game)
-
-    w, h = game.width, game.height
-    overlay = pygame.Surface((w, h), pygame.SRCALPHA)
-    overlay.fill((5, 10, 12, 190))
-    surf.blit(overlay, (0, 0))
+    surf.blit(game.result_overlay_surf, (0, 0))
 
     s = game.scale
     cx = game.center_x
-    y = h * 0.22
+    y = game.height * 0.22
 
     if game.result_kind == "WIN":
         title = f"{KAIJU_NAME} — DOWN"
@@ -1244,31 +1301,31 @@ def draw_result(surf, game):
 
 
 # ===========================================================================
-# DEBUG OVERLAYS -- drawn directly on the real screen, after upscale, so
-# they stay crisp regardless of RENDER_SCALE.
+# DEBUG OVERLAYS -- text re-renders throttled to DEBUG_TEXT_REFRESH; the
+# finger position dots are cheap draw.circle calls and stay live every frame.
 # ===========================================================================
 
 def draw_touch_debug(game):
     screen = game.screen
-    font = game.font_debug
-    sx, sy = game.real_w / game.width, game.real_h / game.height
     for tid, t in game.touches.items():
-        rx, ry = t["last_x"] * sx, t["last_y"] * sy
+        x, y = t["last_x"], t["last_y"]
         col = {"look": COL_CYAN, "fire": COL_ORANGE, "dodge_l": COL_GREEN, "dodge_r": COL_GREEN}.get(t["zone"], COL_WHITE)
-        pygame.draw.circle(screen, col, (int(rx), int(ry)), 18, 3)
-        label = font.render(f"{tid}:{t['zone']}", True, col)
-        screen.blit(label, (rx + 22, ry - 10))
+        pygame.draw.circle(screen, col, (int(x), int(y)), 14, 2)
 
-    info = f"look_active={game.look_active} fire_held={game.fire_held} yaw={game.player.yaw:.1f} yaw_vel={game.player.yaw_velocity:.2f}"
-    txt = font.render(info, True, COL_CYAN)
-    screen.blit(txt, (10, game.real_h - 30))
+    if game.debug_touch_surf is None or game.debug_refresh_due:
+        ids = " ".join(f"{tid}:{t['zone']}" for tid, t in game.touches.items()) or "none"
+        info = f"{ids}  look={game.look_active} fire={game.fire_held} yaw={game.player.yaw:.1f}"
+        game.debug_touch_surf = game.font_debug.render(info, True, COL_CYAN)
+    screen.blit(game.debug_touch_surf, (10, game.height - 22))
 
 
 def draw_perf_debug(game):
-    fps = game.clock.get_fps()
-    ms = game.clock.get_time()
-    txt = game.font_debug.render(f"FPS {fps:.0f}  {ms}ms  render={game.width}x{game.height}", True, COL_GREEN)
-    game.screen.blit(txt, (10, 10))
+    if game.debug_perf_surf is None or game.debug_refresh_due:
+        fps = game.clock.get_fps()
+        game.debug_perf_surf = game.font_debug.render(
+            f"FPS {fps:.0f}  render={game.width}x{game.height}  pygame={pygame.version.ver}",
+            True, COL_GREEN)
+    game.screen.blit(game.debug_perf_surf, (10, 6))
 
 
 # ===========================================================================
